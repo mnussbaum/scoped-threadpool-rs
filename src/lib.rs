@@ -37,6 +37,7 @@
 //!             }
 //!         }
 //!     });
+//!     pool.join_all();
 //!
 //!     assert_eq!(vec, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 //! }
@@ -76,6 +77,7 @@ type Thunk<'a> = Box<FnBox + Send + 'a>;
 
 impl Drop for Pool {
     fn drop(&mut self) {
+        self.join_all();
         self.job_sender = None;
     }
 }
@@ -168,9 +170,6 @@ impl Pool {
 
     /// Borrows the pool and allows executing jobs on other
     /// threads during that scope via the argument of the closure.
-    ///
-    /// This method will block until the closure and all its jobs have
-    /// run to completion.
     pub fn scoped<'pool, 'scope, F, R>(&'pool mut self, f: F) -> R
         where F: FnOnce(&Scope<'pool, 'scope>) -> R
     {
@@ -184,6 +183,28 @@ impl Pool {
     /// Returns the number of threads inside this pool.
     pub fn thread_count(&self) -> u32 {
         self.threads.len() as u32
+    }
+
+    /// Blocks until all currently queued jobs have run to completion.
+    pub fn join_all(&self) {
+        for _ in 0..self.threads.len() {
+            self.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
+        }
+
+        // Syncronize/Join with threads
+        // This has to be a two step process
+        // to make sure _all_ threads received _one_ Join message each.
+
+        // This loop will block on every thread until it
+        // received and reacted to its Join message.
+        for thread_data in &self.threads {
+            thread_data.pool_sync_rx.recv().unwrap();
+        }
+
+        // Once all threads joined the jobs, send them a continue message
+        for thread_data in &self.threads {
+            thread_data.thread_sync_tx.send(()).unwrap();
+        }
     }
 }
 
@@ -224,32 +245,8 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
         self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b)).unwrap();
     }
 
-    /// Blocks until all currently queued jobs have run to completion.
     pub fn join_all(&self) {
-        for _ in 0..self.pool.threads.len() {
-            self.pool.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
-        }
-
-        // Syncronize/Join with threads
-        // This has to be a two step process
-        // to make sure _all_ threads received _one_ Join message each.
-
-        // This loop will block on every thread until it
-        // received and reacted to its Join message.
-        for thread_data in &self.pool.threads {
-            thread_data.pool_sync_rx.recv().unwrap();
-        }
-
-        // Once all threads joined the jobs, send them a continue message
-        for thread_data in &self.pool.threads {
-            thread_data.thread_sync_tx.send(()).unwrap();
-        }
-    }
-}
-
-impl<'pool, 'scope> Drop for Scope<'pool, 'scope> {
-    fn drop(&mut self) {
-        self.join_all();
+        self.pool.join_all();
     }
 }
 
@@ -278,6 +275,7 @@ mod tests {
                     }
                 }
             });
+            pool.join_all();
 
             let mut vec2 = vec![0, 1, 2, 3, 4];
             for e in vec2.iter_mut() {
@@ -348,6 +346,8 @@ mod tests {
                 });
             }
         });
+
+        pool.join_all();
 
         assert_eq!(rx.iter().take(3).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
