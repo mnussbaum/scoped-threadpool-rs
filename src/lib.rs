@@ -30,14 +30,12 @@
 //!         for e in &mut vec {
 //!             // ... and add 1 to it in a seperate thread
 //!             // (execute() is safe to call in nightly)
-//!             unsafe {
-//!                 scope.execute(move || {
-//!                     *e += 1;
-//!                 });
-//!             }
+//!             scope.execute(move || {
+//!                 *e += 1;
+//!             });
 //!         }
 //!     });
-//!     pool.join_all();
+//!     pool.join_and_stop();
 //!
 //!     assert_eq!(vec, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 //! }
@@ -53,7 +51,7 @@
 extern crate lazy_static;
 
 use std::thread::{self, JoinHandle};
-use std::sync::mpsc::{channel, Sender, Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::marker::PhantomData;
 use std::mem;
@@ -77,7 +75,7 @@ type Thunk<'a> = Box<FnBox + Send + 'a>;
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        self.join_all();
+        self.join_and_stop();
         self.job_sender = None;
     }
 }
@@ -85,14 +83,10 @@ impl Drop for Pool {
 /// A threadpool that acts as a handle to a number
 /// of threads spawned at construction.
 pub struct Pool {
-    threads: Vec<ThreadData>,
-    job_sender: Option<Sender<Message>>
-}
-
-struct ThreadData {
-    _thread_join_handle: JoinHandle<()>,
-    pool_sync_rx: Receiver<()>,
-    thread_sync_tx: SyncSender<()>,
+    job_sender: Option<Sender<Message>>,
+    running: bool,
+    thread_count: u32,
+    threads: Vec<JoinHandle<()>>,
 }
 
 impl Pool {
@@ -110,11 +104,6 @@ impl Pool {
         for _ in 0..n {
             let job_receiver = job_receiver.clone();
 
-            let (pool_sync_tx, pool_sync_rx) =
-                sync_channel::<()>(0);
-            let (thread_sync_tx, thread_sync_rx) =
-                sync_channel::<()>(0);
-
             let thread = thread::spawn(move || {
                 loop {
                     let message = {
@@ -127,67 +116,51 @@ impl Pool {
                     match message {
                         Ok(Message::NewJob(job)) => {
                             job.call_box();
-                        }
-                        Ok(Message::Join) => {
-                            // Syncronize/Join with pool.
-                            // This has to be a two step
-                            // process to ensure that all threads
-                            // finished their work before the pool
-                            // can continue
-
-                            // Wait until the pool started syncing with threads
-                            if pool_sync_tx.send(()).is_err() {
-                                // The pool was dropped.
-                                break;
-                            }
-
-                            // Wait until the pool finished syncing with threads
-                            if thread_sync_rx.recv().is_err() {
-                                // The pool was dropped.
-                                break;
-                            }
-                        }
+                        },
+                        Ok(Message::Join) => break,
                         Err(..) => {
                             // The pool was dropped.
                             break
-                        }
+                        },
                     }
                 }
             });
 
-            threads.push(ThreadData {
-                _thread_join_handle: thread,
-                pool_sync_rx: pool_sync_rx,
-                thread_sync_tx: thread_sync_tx,
-            });
+            threads.push(thread);
         }
 
         Pool {
-            threads: threads,
             job_sender: Some(job_sender),
+            running: true,
+            thread_count: n,
+            threads: threads,
         }
     }
 
     /// Borrows the pool and allows executing jobs on other
     /// threads during that scope via the argument of the closure.
     pub fn scoped<'pool, 'scope, F, R>(&'pool mut self, f: F) -> R
-        where F: FnOnce(&Scope<'pool, 'scope>) -> R
+        where F: FnOnce(&mut Scope<'pool, 'scope>) -> R
     {
-        let scope = Scope {
+        let mut scope = Scope {
             pool: self,
             _marker: PhantomData,
         };
-        f(&scope)
+        f(&mut scope)
     }
 
     /// Returns the number of threads inside this pool.
     pub fn thread_count(&self) -> u32 {
-        self.threads.len() as u32
+        self.thread_count
     }
 
     /// Blocks until all currently queued jobs have run to completion.
-    pub fn join_all(&self) {
-        for _ in 0..self.threads.len() {
+    pub fn join_and_stop(&mut self) {
+        if !self.running {
+            return
+        }
+
+        for _ in 0..self.thread_count {
             self.job_sender.as_ref().unwrap().send(Message::Join).unwrap();
         }
 
@@ -197,14 +170,12 @@ impl Pool {
 
         // This loop will block on every thread until it
         // received and reacted to its Join message.
-        for thread_data in &self.threads {
-            thread_data.pool_sync_rx.recv().unwrap();
+        let threads = mem::replace(&mut self.threads, Vec::new());
+        for join_handle in threads {
+            join_handle.join().unwrap();
         }
 
-        // Once all threads joined the jobs, send them a continue message
-        for thread_data in &self.threads {
-            thread_data.thread_sync_tx.send(()).unwrap();
-        }
+        self.running = false
     }
 }
 
@@ -245,8 +216,12 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
         self.pool.job_sender.as_ref().unwrap().send(Message::NewJob(b)).unwrap();
     }
 
-    pub fn join_all(&self) {
-        self.pool.join_all();
+    /// Join all threads and stop pool
+    ///
+    /// This will wait for all threads to finish execution and return.
+    /// It is a destructive action, and will render the pool unusable.
+    pub fn join_and_stop(&mut self) {
+        self.pool.join_and_stop();
     }
 }
 
@@ -256,26 +231,26 @@ impl<'pool, 'scope> Scope<'pool, 'scope> {
 mod tests {
     #![cfg_attr(feature="nightly", allow(unused_unsafe))]
 
-    use super::Pool;
-    use std::thread;
     use std::sync;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::Pool;
 
     #[test]
     fn smoketest() {
-        let mut pool = Pool::new(4);
-
         for i in 1..7 {
+            let mut pool = Pool::new(4);
+
             let mut vec = vec![0, 1, 2, 3, 4];
             pool.scoped(|s| {
                 for e in vec.iter_mut() {
-                    unsafe {
-                        s.execute(move || {
-                            *e += i;
-                        });
-                    }
+                    s.execute(move || {
+                        *e += i;
+                    });
                 }
             });
-            pool.join_all();
+            pool.join_and_stop();
 
             let mut vec2 = vec![0, 1, 2, 3, 4];
             for e in vec2.iter_mut() {
@@ -291,11 +266,9 @@ mod tests {
     fn thread_panic() {
         let mut pool = Pool::new(4);
         pool.scoped(|scoped| {
-            unsafe {
-                scoped.execute(move || {
-                    panic!()
-                });
-            }
+            scoped.execute(move || {
+                panic!()
+            });
         });
     }
 
@@ -316,40 +289,30 @@ mod tests {
     }
 
     #[test]
-    fn join_all() {
+    fn join_and_stop() {
         let mut pool = Pool::new(4);
 
         let (tx_, rx) = sync::mpsc::channel();
 
-        pool.scoped(|scoped| {
+        pool.scoped(|mut scoped| {
             let tx = tx_.clone();
-            unsafe {
-                scoped.execute(move || {
-                    thread::sleep_ms(1000);
-                    tx.send(2).unwrap();
-                });
-            }
+            scoped.execute(move || {
+                thread::sleep(Duration::from_millis(1000));
+                tx.send(2).unwrap();
+            });
 
             let tx = tx_.clone();
-            unsafe {
-                scoped.execute(move || {
-                    tx.send(1).unwrap();
-                });
-            }
+            scoped.execute(move || {
+                tx.send(1).unwrap();
+            });
 
-            scoped.join_all();
-
-            let tx = tx_.clone();
-            unsafe {
-                scoped.execute(move || {
-                    tx.send(3).unwrap();
-                });
-            }
+            scoped.join_and_stop();
         });
 
-        pool.join_all();
+        pool.join_and_stop();
+        pool.join_and_stop();
 
-        assert_eq!(rx.iter().take(3).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(rx.iter().take(2).collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[test]
